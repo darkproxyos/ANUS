@@ -1,3 +1,4 @@
+console.log("=== PONG SERVER V2 DEPLOYED ===");
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
