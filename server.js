@@ -1,125 +1,257 @@
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
-const cors = require("cors");
-const path = require("path");
 
 const app = express();
 const server = http.createServer(app);
+
 const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] },
-  transports: ["websocket", "polling"],
-});
-
-app.use(cors());
-app.use(express.static(path.join(__dirname, "public")));
-
-const ROUND_DURATION = 20;
-const MAX_PLAYERS = 8;
-const rooms = {};
-
-function createRoom(id) {
-  return { id, players: {}, scores: {}, guesses: {},
-           phase: "waiting", secret: null, round: 0,
-           timeLeft: ROUND_DURATION, timer: null };
-}
-function room(id) {
-  if (!rooms[id]) rooms[id] = createRoom(id);
-  return rooms[id];
-}
-function publicPlayers(r) {
-  return Object.values(r.players).map(p => ({
-    id: p.id, name: p.name,
-    score: r.scores[p.id] || 0,
-    guessed: r.guesses[p.id] !== undefined,
-  }));
-}
-function startRound(roomId) {
-  const r = rooms[roomId];
-  if (!r) return;
-  r.phase = "playing";
-  r.secret = Math.floor(Math.random() * 100) + 1;
-  r.guesses = {};
-  r.round += 1;
-  r.timeLeft = ROUND_DURATION;
-  io.to(roomId).emit("round_start", { round: r.round, timeLeft: r.timeLeft, players: publicPlayers(r) });
-  if (r.timer) clearInterval(r.timer);
-  r.timer = setInterval(() => {
-    r.timeLeft -= 1;
-    io.to(roomId).emit("timer", { timeLeft: r.timeLeft });
-    if (r.timeLeft <= 0) { clearInterval(r.timer); endRound(roomId); }
-  }, 1000);
-}
-function endRound(roomId) {
-  const r = rooms[roomId];
-  if (!r) return;
-  r.phase = "results";
-  if (r.timer) clearInterval(r.timer);
-  const results = Object.values(r.players).map(p => {
-    const g = r.guesses[p.id];
-    const diff = g !== undefined ? Math.abs(g - r.secret) : 999;
-    const pts = g !== undefined ? Math.max(0, 100 - diff * 5) : 0;
-    r.scores[p.id] = (r.scores[p.id] || 0) + pts;
-    return { id: p.id, name: p.name, guess: g ?? "—", diff: g !== undefined ? diff : "—",
-             points: pts, total: r.scores[p.id] };
-  }).sort((a, b) => b.total - a.total);
-  io.to(roomId).emit("round_end", { secret: r.secret, results, round: r.round });
-  setTimeout(() => {
-    if (rooms[roomId] && Object.keys(rooms[roomId].players).length >= 1) startRound(roomId);
-  }, 5000);
-}
-
-io.on("connection", socket => {
-  socket.on("join_room", ({ roomId, playerName }) => {
-    const r = room(roomId);
-    if (Object.keys(r.players).length >= MAX_PLAYERS)
-      return socket.emit("err", { msg: "Sala llena" });
-    const name = (playerName || "Jugador").slice(0, 16).trim() || "Jugador";
-    r.players[socket.id] = { id: socket.id, name };
-    r.scores[socket.id] = r.scores[socket.id] || 0;
-    socket.join(roomId);
-    socket.data.roomId = roomId;
-    socket.emit("joined", {
-      playerId: socket.id,
-      room: { id: r.id, phase: r.phase, round: r.round, timeLeft: r.timeLeft, players: publicPlayers(r) },
-    });
-    socket.to(roomId).emit("player_joined", { player: { id: socket.id, name, score: 0, guessed: false }, players: publicPlayers(r) });
-    if (r.phase === "waiting" && Object.keys(r.players).length >= 1) {
-      setTimeout(() => {
-        const rr = rooms[roomId];
-        if (rr && rr.phase === "waiting" && Object.keys(rr.players).length >= 1) startRound(roomId);
-      }, 2000);
-    }
-  });
-  socket.on("submit_guess", ({ guess }) => {
-    const r = rooms[socket.data.roomId];
-    if (!r || r.phase !== "playing") return;
-    const n = parseInt(guess);
-    if (isNaN(n) || n < 1 || n > 100) return socket.emit("err", { msg: "Número entre 1 y 100" });
-    if (r.guesses[socket.id] !== undefined) return socket.emit("err", { msg: "Ya enviaste tu respuesta" });
-    r.guesses[socket.id] = n;
-    socket.emit("guess_accepted", { guess: n });
-    io.to(socket.data.roomId).emit("player_guessed", { players: publicPlayers(r) });
-    if (Object.keys(r.guesses).length >= Object.keys(r.players).length) {
-      clearInterval(r.timer);
-      endRound(socket.data.roomId);
-    }
-  });
-  socket.on("disconnect", () => {
-    const roomId = socket.data.roomId;
-    if (!roomId || !rooms[roomId]) return;
-    const r = rooms[roomId];
-    const p = r.players[socket.id];
-    if (p) {
-      delete r.players[socket.id];
-      socket.to(roomId).emit("player_left", { playerId: socket.id, playerName: p.name, players: publicPlayers(r) });
-    }
-    if (Object.keys(r.players).length === 0) {
-      if (r.timer) clearInterval(r.timer);
-      delete rooms[roomId];
-    }
-  });
+  cors: {
+    origin: "*"
+  }
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🎮 http://localhost:${PORT}`));
+
+app.use(express.static("public"));
+
+const GAME_WIDTH = 400;
+const GAME_HEIGHT = 700;
+
+const PADDLE_WIDTH = 100;
+const PADDLE_HEIGHT = 18;
+const BALL_SIZE = 14;
+
+let players = [];
+let gameRunning = false;
+
+const gameState = {
+  ball: {
+    x: GAME_WIDTH / 2,
+    y: GAME_HEIGHT / 2,
+    vx: 4,
+    vy: 4
+  },
+
+  paddles: {
+    player1: GAME_WIDTH / 2 - PADDLE_WIDTH / 2,
+    player2: GAME_WIDTH / 2 - PADDLE_WIDTH / 2
+  },
+
+  score: {
+    player1: 0,
+    player2: 0
+  }
+};
+
+function randomDirection() {
+  return Math.random() > 0.5 ? 1 : -1;
+}
+
+function resetBall() {
+  gameState.ball.x = GAME_WIDTH / 2;
+  gameState.ball.y = GAME_HEIGHT / 2;
+
+  gameState.ball.vx = randomDirection() * (4 + Math.random() * 2);
+  gameState.ball.vy = randomDirection() * (4 + Math.random() * 2);
+}
+
+function resetGame() {
+  gameState.score.player1 = 0;
+  gameState.score.player2 = 0;
+
+  gameState.paddles.player1 =
+    GAME_WIDTH / 2 - PADDLE_WIDTH / 2;
+
+  gameState.paddles.player2 =
+    GAME_WIDTH / 2 - PADDLE_WIDTH / 2;
+
+  resetBall();
+}
+
+function pauseGame() {
+  gameRunning = false;
+}
+
+function startGame() {
+  if (players.length !== 2) return;
+
+  resetGame();
+  gameRunning = true;
+
+  io.emit("game_start", {
+    message: "Game Started"
+  });
+
+  console.log("Game started");
+}
+
+function emitWaiting() {
+  io.emit("waiting", {
+    players: players.length,
+    message: "Waiting for second player..."
+  });
+}
+
+io.on("connection", (socket) => {
+  console.log("Connected:", socket.id);
+
+  socket.on("join_game", () => {
+    if (players.length >= 2) {
+      socket.emit("waiting", {
+        message: "Room Full"
+      });
+      return;
+    }
+
+    const playerNumber = players.length + 1;
+
+    players.push({
+      id: socket.id,
+      number: playerNumber
+    });
+
+    socket.playerNumber = playerNumber;
+
+    console.log(
+      `Player ${playerNumber} joined (${socket.id})`
+    );
+
+    if (players.length < 2) {
+      emitWaiting();
+    } else {
+      startGame();
+    }
+  });
+
+  socket.on("paddle_move", (x) => {
+    if (!socket.playerNumber) return;
+
+    const clamped = Math.max(
+      0,
+      Math.min(GAME_WIDTH - PADDLE_WIDTH, x)
+    );
+
+    if (socket.playerNumber === 1) {
+      gameState.paddles.player1 = clamped;
+    } else {
+      gameState.paddles.player2 = clamped;
+    }
+  });
+
+  socket.on("disconnect", () => {
+    console.log("Disconnected:", socket.id);
+
+    players = players.filter(
+      p => p.id !== socket.id
+    );
+
+    pauseGame();
+
+    io.emit("player_disconnected", {
+      message: "Player disconnected"
+    });
+
+    emitWaiting();
+  });
+});
+
+function gameLoop() {
+  if (!gameRunning) return;
+  if (players.length < 2) return;
+
+  const ball = gameState.ball;
+
+  ball.x += ball.vx;
+  ball.y += ball.vy;
+
+  if (ball.x <= 0) {
+    ball.x = 0;
+    ball.vx *= -1;
+  }
+
+  if (ball.x >= GAME_WIDTH - BALL_SIZE) {
+    ball.x = GAME_WIDTH - BALL_SIZE;
+    ball.vx *= -1;
+  }
+
+  const paddleTopY = 20;
+  const paddleBottomY = GAME_HEIGHT - 40;
+
+  if (
+    ball.y <= paddleTopY + PADDLE_HEIGHT &&
+    ball.y + BALL_SIZE >= paddleTopY &&
+    ball.x + BALL_SIZE >= gameState.paddles.player2 &&
+    ball.x <=
+      gameState.paddles.player2 + PADDLE_WIDTH
+  ) {
+    ball.vy = Math.abs(ball.vy);
+  }
+
+  if (
+    ball.y + BALL_SIZE >= paddleBottomY &&
+    ball.y <= paddleBottomY + PADDLE_HEIGHT &&
+    ball.x + BALL_SIZE >= gameState.paddles.player1 &&
+    ball.x <=
+      gameState.paddles.player1 + PADDLE_WIDTH
+  ) {
+    ball.vy = -Math.abs(ball.vy);
+  }
+
+  if (ball.y < 0) {
+    gameState.score.player1++;
+
+    if (gameState.score.player1 >= 5) {
+      gameRunning = false;
+
+      io.emit("game_over", {
+        winner: 1,
+        score: gameState.score
+      });
+
+      return;
+    }
+
+    resetBall();
+  }
+
+  if (ball.y > GAME_HEIGHT) {
+    gameState.score.player2++;
+
+    if (gameState.score.player2 >= 5) {
+      gameRunning = false;
+
+      io.emit("game_over", {
+        winner: 2,
+        score: gameState.score
+      });
+
+      return;
+    }
+
+    resetBall();
+  }
+
+  io.emit("game_state", {
+    width: GAME_WIDTH,
+    height: GAME_HEIGHT,
+
+    ball: {
+      x: gameState.ball.x,
+      y: gameState.ball.y
+    },
+
+    paddles: {
+      player1: gameState.paddles.player1,
+      player2: gameState.paddles.player2
+    },
+
+    score: gameState.score
+  });
+}
+
+setInterval(gameLoop, 1000 / 60);
+
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
